@@ -5,10 +5,8 @@
 //! - [`EndpointDiscover`]: A poll-based trait for discovering endpoint changes
 //! - [`EndpointUpdateCache`]: Batches updates from a discover and provides atomic consume
 
-use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::BoxError;
 
@@ -73,87 +71,107 @@ pub(crate) trait EndpointDiscover<K, S> {
 
 /// A cache that batches endpoint updates from an [`EndpointDiscover`].
 ///
-/// The cache spawns a background actor task that eagerly polls the discover
-/// and accumulates updates (inserts and removes) in a [`DashMap`]. The
-/// [`consume`](Self::consume) operation atomically retrieves all pending updates.
+/// The cache accumulates updates (inserts and removes) in a [`HashMap`].
+/// The [`consume`](Self::consume) operation returns all pending updates and clears the cache.
 ///
 /// # Design
 ///
-/// - A background tokio task eagerly polls the discover
 /// - Updates are stored as `Option<S>`: `Some(service)` for inserts, `None` for removes
-/// - Same key can be inserted then removed; the DashMap naturally handles this by overwriting
-/// - `consume()` uses [`ArcSwap`] to atomically swap out the current batch
-pub(crate) struct EndpointUpdateCache<K, S>
+/// - Same key can be inserted then removed; the HashMap naturally handles this by overwriting
+/// - `poll_updates()` polls the discover and accumulates updates
+/// - `consume()` returns and clears all pending updates
+///
+/// # Thread Safety
+///
+/// This type is NOT thread-safe. It is designed to be used behind a `tower::Buffer`
+/// which serializes access through its worker task.
+pub(crate) struct EndpointUpdateCache<K, S, D>
 where
     K: Hash + Eq,
 {
+    /// The endpoint discover source
+    discover: D,
     /// Cached updates: Some(S) = insert, None = remove
-    updates: Arc<ArcSwap<DashMap<K, Option<S>>>>,
-    /// Handle to the background polling task
-    #[allow(dead_code)]
-    task_handle: tokio::task::JoinHandle<()>,
+    updates: HashMap<K, Option<S>>,
+    /// Whether the discover has been exhausted
+    exhausted: bool,
 }
 
-impl<K, S> EndpointUpdateCache<K, S>
+impl<K, S, D> EndpointUpdateCache<K, S, D>
 where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    S: Send + Sync + 'static,
+    K: Hash + Eq + Clone,
+    D: EndpointDiscover<K, S>,
 {
-    /// Creates a new `EndpointUpdateCache` that spawns a background task to poll the discover.
-    pub(crate) fn spawn<D>(mut discover: D) -> Self
-    where
-        D: EndpointDiscover<K, S> + Send + 'static,
-    {
-        let updates = Arc::new(ArcSwap::new(Arc::new(DashMap::new())));
-        let updates_clone = updates.clone();
-
-        let task_handle = tokio::spawn(async move {
-            loop {
-                let update = std::future::poll_fn(|cx| discover.poll_discover(cx)).await;
-                match update {
-                    Some(Ok(EndpointUpdate::Insert(key, service))) => {
-                        updates_clone.load().insert(key, Some(service));
-                    }
-                    Some(Ok(EndpointUpdate::Remove(key))) => {
-                        updates_clone.load().insert(key, None);
-                    }
-                    Some(Err(e)) => {
-                        tracing::warn!("Error polling endpoint discover: {e}");
-                    }
-                    None => {
-                        // Discovery exhausted
-                        break;
-                    }
-                }
-            }
-        });
-
+    /// Creates a new `EndpointUpdateCache` with the given discover.
+    pub(crate) fn new(discover: D) -> Self {
         Self {
-            updates,
-            task_handle,
+            discover,
+            updates: HashMap::new(),
+            exhausted: false,
         }
     }
 
-    /// Atomically consumes all cached updates, returning them to the caller.
+    /// Polls the discover for updates, accumulating them in the cache.
     ///
-    /// This swaps the internal cache with an empty [`DashMap`] and returns the
-    /// previous contents. The returned map contains:
+    /// Returns `Poll::Ready(())` when at least one update was processed or the discover is exhausted.
+    /// Returns `Poll::Pending` when no updates are available.
+    pub(crate) fn poll_updates(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.exhausted {
+            return Poll::Ready(());
+        }
+
+        let mut got_update = false;
+
+        // Poll discover until pending or exhausted
+        loop {
+            match self.discover.poll_discover(cx) {
+                Poll::Ready(Some(Ok(EndpointUpdate::Insert(key, service)))) => {
+                    self.updates.insert(key, Some(service));
+                    got_update = true;
+                }
+                Poll::Ready(Some(Ok(EndpointUpdate::Remove(key)))) => {
+                    self.updates.insert(key, None);
+                    got_update = true;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    tracing::warn!("Error polling endpoint discover: {e}");
+                    got_update = true;
+                }
+                Poll::Ready(None) => {
+                    // Discovery exhausted
+                    self.exhausted = true;
+                    return Poll::Ready(());
+                }
+                Poll::Pending => {
+                    return if got_update {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    };
+                }
+            }
+        }
+    }
+
+    /// Consumes all cached updates, returning them to the caller.
+    ///
+    /// The returned map contains:
     /// - `Some(service)` for endpoints that should be inserted/updated
     /// - `None` for endpoints that should be removed
-    pub(crate) fn consume(&self) -> Arc<DashMap<K, Option<S>>> {
-        self.updates.swap(Arc::new(DashMap::new()))
+    pub(crate) fn consume(&mut self) -> HashMap<K, Option<S>> {
+        std::mem::take(&mut self.updates)
     }
 
     /// Returns the number of pending updates in the cache.
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
-        self.updates.load().len()
+        self.updates.len()
     }
 
     /// Returns `true` if there are no pending updates.
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.updates.load().is_empty()
+        self.updates.is_empty()
     }
 }
 
@@ -188,7 +206,7 @@ mod tests {
         }
     }
 
-    impl<K: Send, S: Send> EndpointDiscover<K, S> for MockDiscover<K, S> {
+    impl<K, S> EndpointDiscover<K, S> for MockDiscover<K, S> {
         fn poll_discover(
             &mut self,
             _cx: &mut Context<'_>,
@@ -197,36 +215,42 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_cache_accumulates_inserts() {
+    #[test]
+    fn test_cache_accumulates_inserts() {
         let discover = MockDiscover::new(vec![
-            Ok(EndpointUpdate::Insert("addr1".to_string(), "svc1".to_string())),
-            Ok(EndpointUpdate::Insert("addr2".to_string(), "svc2".to_string())),
+            Ok(EndpointUpdate::Insert("addr1", "svc1")),
+            Ok(EndpointUpdate::Insert("addr2", "svc2")),
         ]);
-        let cache = EndpointUpdateCache::spawn(discover);
+        let mut cache = EndpointUpdateCache::new(discover);
 
-        // Wait for the background task to process all updates
-        tokio::task::yield_now().await;
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        // Poll to process all updates
+        let _ = cache.poll_updates(&mut cx);
 
         let consumed = cache.consume();
         assert_eq!(consumed.len(), 2);
-        assert_eq!(*consumed.get("addr1").unwrap(), Some("svc1".to_string()));
-        assert_eq!(*consumed.get("addr2").unwrap(), Some("svc2".to_string()));
+        assert_eq!(*consumed.get("addr1").unwrap(), Some("svc1"));
+        assert_eq!(*consumed.get("addr2").unwrap(), Some("svc2"));
 
         // Cache should be empty after consume
         assert!(cache.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_cache_handles_insert_then_remove() {
+    #[test]
+    fn test_cache_handles_insert_then_remove() {
         let discover = MockDiscover::new(vec![
-            Ok(EndpointUpdate::Insert("addr1".to_string(), "svc1".to_string())),
-            Ok(EndpointUpdate::Remove("addr1".to_string())),
+            Ok(EndpointUpdate::Insert("addr1", "svc1")),
+            Ok(EndpointUpdate::Remove("addr1")),
         ]);
-        let cache = EndpointUpdateCache::spawn(discover);
+        let mut cache = EndpointUpdateCache::new(discover);
 
-        // Wait for the background task to process all updates
-        tokio::task::yield_now().await;
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        // Poll to process all updates
+        let _ = cache.poll_updates(&mut cx);
 
         // Should have one entry with None (remove)
         let consumed = cache.consume();
@@ -234,32 +258,34 @@ mod tests {
         assert_eq!(*consumed.get("addr1").unwrap(), None);
     }
 
-    #[tokio::test]
-    async fn test_cache_handles_remove_then_insert() {
+    #[test]
+    fn test_cache_handles_remove_then_insert() {
         let discover = MockDiscover::new(vec![
-            Ok(EndpointUpdate::Remove("addr1".to_string())),
-            Ok(EndpointUpdate::Insert("addr1".to_string(), "svc1".to_string())),
+            Ok(EndpointUpdate::Remove("addr1")),
+            Ok(EndpointUpdate::Insert("addr1", "svc1")),
         ]);
-        let cache = EndpointUpdateCache::spawn(discover);
+        let mut cache = EndpointUpdateCache::new(discover);
 
-        // Wait for the background task to process all updates
-        tokio::task::yield_now().await;
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        // Poll to process all updates
+        let _ = cache.poll_updates(&mut cx);
 
         // Should have one entry with Some (insert wins)
         let consumed = cache.consume();
-        assert_eq!(*consumed.get("addr1").unwrap(), Some("svc1".to_string()));
+        assert_eq!(*consumed.get("addr1").unwrap(), Some("svc1"));
     }
 
-    #[tokio::test]
-    async fn test_consume_is_atomic() {
-        let discover = MockDiscover::new(vec![Ok(EndpointUpdate::Insert(
-            "addr1".to_string(),
-            "svc1".to_string(),
-        ))]);
-        let cache = EndpointUpdateCache::spawn(discover);
+    #[test]
+    fn test_consume_clears_cache() {
+        let discover = MockDiscover::new(vec![Ok(EndpointUpdate::Insert("addr1", "svc1"))]);
+        let mut cache = EndpointUpdateCache::new(discover);
 
-        // Wait for the background task to process all updates
-        tokio::task::yield_now().await;
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        let _ = cache.poll_updates(&mut cx);
 
         // First consume gets the update
         let first = cache.consume();

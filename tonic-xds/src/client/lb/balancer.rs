@@ -4,16 +4,42 @@
 //! - [`LbPicker`]: Trait for endpoint selection algorithms
 //! - [`P2cPicker`]: Power-of-two-choices picker implementation
 //! - [`LoadBalancer`]: Tower service that balances requests across endpoints
+//! - [`BalancerRequest`]: Request enum for real requests and discovery polling
 
 use super::discover::{EndpointDiscover, EndpointUpdateCache};
 use crate::common::async_util::BoxFuture;
 use rand::Rng;
 use rand::SeedableRng;
 use std::hash::Hash;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::ready_cache::ReadyCache;
 use tower::{load::Load, BoxError, Service};
+
+/// Request type for the load balancer.
+///
+/// This enum allows the load balancer to handle both real requests and
+/// discovery polling through the same `tower::Buffer` channel.
+pub(crate) enum BalancerRequest<Req> {
+    /// A real request to be routed to an endpoint.
+    Call(Req),
+    /// A request to poll the endpoint discover for updates.
+    PollDiscover,
+}
+
+/// Response type for discovery polling.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PollDiscoverResponse {
+    /// Number of updates processed.
+    pub updates_processed: usize,
+}
+
+/// Response type for the load balancer.
+pub(crate) enum BalancerResponse<Resp> {
+    /// Response from a real request.
+    Call(Resp),
+    /// Response from discovery polling.
+    PollDiscover(PollDiscoverResponse),
+}
 
 /// The type of endpoint change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,32 +153,31 @@ where
 /// maintains a [`ReadyCache`] of available services, and uses an [`LbPicker`]
 /// to select endpoints for incoming requests.
 ///
-/// The cache spawns a background task that eagerly polls the discover,
-/// so updates are accumulated asynchronously and consumed in `poll_ready`.
-pub(crate) struct LoadBalancer<K, S, P, Req>
+/// # Thread Safety
+///
+/// This type is designed to be used behind a `tower::Buffer` which serializes
+/// access through its worker task. Discovery updates are triggered by sending
+/// `BalancerRequest::PollDiscover` through the buffer.
+pub(crate) struct LoadBalancer<K, S, D, P, Req>
 where
     K: Hash + Eq,
 {
-    cache: EndpointUpdateCache<K, S>,
+    cache: EndpointUpdateCache<K, S, D>,
     ready_cache: ReadyCache<K, S, Req>,
     picker: P,
 }
 
-impl<K, S, P, Req> LoadBalancer<K, S, P, Req>
+impl<K, S, D, P, Req> LoadBalancer<K, S, D, P, Req>
 where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    S: Service<Req> + Send + Sync + 'static,
+    K: Hash + Eq + Clone,
+    S: Service<Req>,
+    D: EndpointDiscover<K, S>,
     P: LbPicker<K, S, Req>,
 {
     /// Creates a new `LoadBalancer` with the given discover and picker.
-    ///
-    /// This spawns a background task that eagerly polls the discover for updates.
-    pub(crate) fn new<D>(discover: D, picker: P) -> Self
-    where
-        D: EndpointDiscover<K, S> + Send + 'static,
-    {
+    pub(crate) fn new(discover: D, picker: P) -> Self {
         Self {
-            cache: EndpointUpdateCache::spawn(discover),
+            cache: EndpointUpdateCache::new(discover),
             ready_cache: ReadyCache::default(),
             picker,
         }
@@ -169,29 +194,23 @@ where
     pub(crate) fn pending_len(&self) -> usize {
         self.ready_cache.pending_len()
     }
+
 }
 
-impl<K, S, P, Req> Service<Req> for LoadBalancer<K, S, P, Req>
+impl<K, S, D, P, Req> LoadBalancer<K, S, D, P, Req>
 where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    S: Service<Req> + Load + Send + Sync + 'static,
+    K: Hash + Eq + Clone,
+    S: Service<Req>,
     S::Error: Into<BoxError>,
-    S::Future: Send + 'static,
-    S::Response: Send + 'static,
-    <S as Load>::Metric: PartialOrd,
+    D: EndpointDiscover<K, S>,
     P: LbPicker<K, S, Req>,
-    Req: Send,
 {
-    type Response = S::Response;
-    type Error = BoxError;
-    type Future = BoxFuture<Result<S::Response, BoxError>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // 1. Consume batched updates from the background polling task
+    /// Applies pending updates from the cache to the ready cache.
+    fn apply_updates(&mut self) -> usize {
         let updates = self.cache.consume();
-        // Unwrap the Arc to take ownership - consume() should be the only holder
-        if let Some(updates) = Arc::into_inner(updates) {
-            for (key, value) in updates.into_iter() {
+        let count = updates.len();
+
+        for (key, value) in updates.into_iter() {
             match value {
                 Some(service) => {
                     // Notify picker of insert
@@ -209,38 +228,66 @@ where
                     self.ready_cache.evict(&key);
                 }
             }
-            }
-        } else {
-            // This shouldn't happen - consume() should return exclusively owned Arc
-            // Log warning and proceed without applying updates
-            tracing::warn!("EndpointUpdateCache::consume() returned shared Arc, skipping updates");
         }
 
-        // 3. Drive pending services to ready
+        count
+    }
+}
+
+impl<K, S, D, P, Req> Service<BalancerRequest<Req>> for LoadBalancer<K, S, D, P, Req>
+where
+    K: Hash + Eq + Clone,
+    S: Service<Req> + Load,
+    S::Error: Into<BoxError>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    <S as Load>::Metric: PartialOrd,
+    D: EndpointDiscover<K, S>,
+    P: LbPicker<K, S, Req>,
+{
+    type Response = BalancerResponse<S::Response>;
+    type Error = BoxError;
+    type Future = BoxFuture<Result<Self::Response, BoxError>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // 1. Poll the discover for updates and apply them
+        let _ = self.cache.poll_updates(cx);
+        self.apply_updates();
+
+        // 2. Drive pending services to ready
         let _ = self.ready_cache.poll_pending(cx);
 
-        // 4. Check if we have any ready endpoints
-        if self.ready_cache.ready_len() > 0 {
-            Poll::Ready(Ok(()))
-        } else if self.ready_cache.pending_len() > 0 {
-            Poll::Pending
-        } else {
-            // No endpoints at all - keep polling for new ones
-            Poll::Pending
-        }
+        // 3. Always ready - PollDiscover can always be handled,
+        // and Call will fail gracefully if no endpoints are ready
+        Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Req) -> Self::Future {
-        // Use picker to select an endpoint index
-        let idx = self
-            .picker
-            .pick(&self.ready_cache, &request)
-            .expect("poll_ready should ensure at least one ready endpoint");
+    fn call(&mut self, request: BalancerRequest<Req>) -> Self::Future {
+        match request {
+            BalancerRequest::PollDiscover => {
+                // Poll discover and apply updates (already done in poll_ready,
+                // but we can report the count)
+                let updates_processed = self.apply_updates();
+                Box::pin(async move {
+                    Ok(BalancerResponse::PollDiscover(PollDiscoverResponse {
+                        updates_processed,
+                    }))
+                })
+            }
+            BalancerRequest::Call(req) => {
+                // Use picker to select an endpoint index
+                let Some(idx) = self.picker.pick(&self.ready_cache, &req) else {
+                    return Box::pin(async move {
+                        Err(BoxError::from("no ready endpoints available"))
+                    });
+                };
 
-        // Call the selected endpoint by index
-        let fut = self.ready_cache.call_ready_index(idx, request);
+                // Call the selected endpoint by index
+                let fut = self.ready_cache.call_ready_index(idx, req);
 
-        Box::pin(async move { fut.await.map_err(Into::into) })
+                Box::pin(async move { fut.await.map(BalancerResponse::Call).map_err(Into::into) })
+            }
+        }
     }
 }
 
@@ -248,6 +295,7 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tower::load::Load;
 
     /// A mock service that tracks load via in-flight count.

@@ -93,7 +93,7 @@ where
     S::Response: Send + 'static,
     S::Error: Into<BoxError>,
     S::Future: Send,
-    <S as tower::load::Load>::Metric: std::fmt::Debug,
+    <S as tower::load::Load>::Metric: PartialOrd + Send,
 {
     type Response = S::Response;
     type Error = BoxError;
@@ -192,17 +192,19 @@ mod tests {
     use crate::client::endpoint::EndpointAddress;
     use crate::client::endpoint::EndpointChannel;
     use crate::common::async_util::BoxFuture;
+    use crate::client::lb::{EndpointDiscover, EndpointUpdate};
     use crate::testutil::grpc::GreeterClient;
     use crate::testutil::grpc::HelloRequest;
     use crate::testutil::grpc::TestServer;
     use crate::xds::route::RouteDecision;
     use crate::xds::route::RouteInput;
-    use crate::xds::xds_manager::BoxDiscover;
+    use crate::xds::xds_manager::BoxEndpointDiscover;
     use crate::xds::xds_manager::{XdsClusterDiscovery, XdsRouter};
+    use std::collections::VecDeque;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
+    use std::task::{Context, Poll};
     use tonic::transport::Channel;
-    use tower::discover::Change;
+    use tower::BoxError;
 
     /// Sets up multiple gRPC test servers and returns their addresses, clients and shutdown handles.
     async fn setup_grpc_servers(
@@ -255,23 +257,41 @@ mod tests {
         }
     }
 
+    /// A simple EndpointDiscover that yields endpoints from a pre-built list.
+    struct MockEndpointDiscover {
+        endpoints: VecDeque<(EndpointAddress, EndpointChannel<Channel>)>,
+    }
+
+    impl MockEndpointDiscover {
+        fn new(endpoints: Vec<(EndpointAddress, Channel)>) -> Self {
+            Self {
+                endpoints: endpoints
+                    .into_iter()
+                    .map(|(addr, channel)| (addr, EndpointChannel::new(channel)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl EndpointDiscover<EndpointAddress, EndpointChannel<Channel>> for MockEndpointDiscover {
+        fn poll_discover(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<EndpointUpdate<EndpointAddress, EndpointChannel<Channel>>, BoxError>>>
+        {
+            match self.endpoints.pop_front() {
+                Some((addr, svc)) => Poll::Ready(Some(Ok(EndpointUpdate::Insert(addr, svc)))),
+                None => Poll::Pending, // No more endpoints, but keep polling
+            }
+        }
+    }
+
     impl XdsClusterDiscovery<EndpointAddress, EndpointChannel<Channel>> for MockXdsManager {
         fn discover_cluster(
             &self,
             _cluster_name: &str,
-        ) -> BoxDiscover<EndpointAddress, EndpointChannel<Channel>> {
-            let endpoints = self.endpoints.clone();
-            let (tx, rx) = mpsc::channel(16);
-
-            tokio::spawn(async move {
-                for (addr, channel) in endpoints {
-                    let endpoint_channel = EndpointChannel::new(channel);
-                    let change = Change::Insert(addr, endpoint_channel);
-                    tx.send(Ok(change)).await.expect("Failed to send SD change");
-                }
-            });
-
-            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+        ) -> BoxEndpointDiscover<EndpointAddress, EndpointChannel<Channel>> {
+            BoxEndpointDiscover::new(MockEndpointDiscover::new(self.endpoints.clone()))
         }
     }
 
@@ -319,7 +339,7 @@ mod tests {
         (successful_requests, error_types, server_counts)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     /// Tests the `XdsChannelGrpc` with a power-of-two-choices load balancer.
     async fn test_xds_channel_grpc_with_p2c_lb() {
         let num_requests = 1000;
@@ -327,7 +347,8 @@ mod tests {
         let (_, servers) = setup_grpc_servers(num_servers).await;
 
         // Create a mock XdsManager with the test servers
-        let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
+        let xds_manager = MockXdsManager::from_test_servers(&servers);
+        let xds_manager = Arc::new(xds_manager);
 
         let xds_channel_builder = XdsChannelBuilder::with_config(XdsChannelConfig::default());
         let xds_channel =

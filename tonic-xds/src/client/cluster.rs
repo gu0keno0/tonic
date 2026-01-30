@@ -1,3 +1,7 @@
+use crate::client::lb::{
+    BalancerRequest, BalancerResponse, EndpointDiscover, LbPicker, LoadBalancer, P2cPicker,
+    PollDiscoverResponse,
+};
 use crate::common::async_util::BoxFuture;
 use dashmap::DashMap;
 use http::{Request, Response};
@@ -8,67 +12,85 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::body::Body as TonicBody;
-use tower::{
-    balance::p2c::Balance, buffer::Buffer, discover::Discover, load::Load, BoxError, Service,
-};
+use tower::{buffer::Buffer, load::Load, BoxError, Service};
 
-type RespFut<Resp> = BoxFuture<Result<Resp, BoxError>>;
+type BalancerRespFut<Resp> = BoxFuture<Result<BalancerResponse<Resp>, BoxError>>;
 
 const DEFAULT_BUFFER_CAPACITY: usize = 1024;
 
 /// `ClusterBalancer` is responsible for managing load balancing requests across multiple channels.
-/// Currently, `ClusterBalancer` leverges `tower::balance::p2c` for doing P2C load balancing. In the future, we will
-/// support more load balancing strategies as needed.
-pub(crate) struct ClusterBalancer<D, Req>
+/// It uses our custom `LoadBalancer` with pluggable `LbPicker` for load balancing strategies.
+pub(crate) struct ClusterBalancer<K, S, D, P, Req>
 where
-    D: Discover,
-    D::Key: Hash,
+    K: Hash + Eq,
 {
-    balancer: Balance<D, Req>,
+    balancer: LoadBalancer<K, S, D, P, Req>,
 }
 
-impl<D, Req> ClusterBalancer<D, Req>
+impl<K, S, D, Req> ClusterBalancer<K, S, D, P2cPicker, Req>
 where
-    D: Discover,
-    D::Key: Hash,
-    D::Service: Service<Req>,
-    <D::Service as Service<Req>>::Error: Into<BoxError>,
+    K: Hash + Eq + Clone,
+    S: Service<Req> + Load,
+    <S as Load>::Metric: PartialOrd,
+    D: EndpointDiscover<K, S>,
 {
-    /// Creates a new `ClusterBalancer` with provided service discovery.
+    /// Creates a new `ClusterBalancer` with provided endpoint discovery and P2C picker.
     pub(crate) fn new(discover: D) -> Self {
         Self {
-            balancer: Balance::new(discover),
+            balancer: LoadBalancer::new(discover, P2cPicker::from_entropy()),
+        }
+    }
+}
+
+impl<K, S, D, P, Req> ClusterBalancer<K, S, D, P, Req>
+where
+    K: Hash + Eq + Clone,
+    S: Service<Req>,
+    D: EndpointDiscover<K, S>,
+    P: LbPicker<K, S, Req>,
+{
+    /// Creates a new `ClusterBalancer` with provided endpoint discovery and custom picker.
+    #[allow(dead_code)]
+    pub(crate) fn with_picker(discover: D, picker: P) -> Self {
+        Self {
+            balancer: LoadBalancer::new(discover, picker),
         }
     }
 
-    /// Returns the number of endpoints currently tracked by the balancer.
-    /// This can be useful for monitoring and debugging purposes.
+    /// Returns the number of ready endpoints currently tracked by the balancer.
     #[allow(dead_code)]
-    pub(crate) fn len(&self) -> usize {
-        self.balancer.len()
+    pub(crate) fn ready_len(&self) -> usize {
+        self.balancer.ready_len()
+    }
+
+    /// Returns the number of pending endpoints currently tracked by the balancer.
+    #[allow(dead_code)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.balancer.pending_len()
     }
 }
 
-impl<D, Req> Service<Req> for ClusterBalancer<D, Req>
+impl<K, S, D, P, Req> Service<BalancerRequest<Req>> for ClusterBalancer<K, S, D, P, Req>
 where
-    D: Discover + Unpin,
-    D::Key: Hash + Clone,
-    D::Error: Into<BoxError>,
-    D::Service: Service<Req> + Load,
-    <D::Service as Load>::Metric: std::fmt::Debug,
-    <D::Service as Service<Req>>::Error: Into<BoxError> + 'static,
-    <D::Service as Service<Req>>::Future: Send + 'static,
+    K: Hash + Eq + Clone,
+    S: Service<Req> + Load,
+    S::Error: Into<BoxError>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    <S as Load>::Metric: PartialOrd,
+    D: EndpointDiscover<K, S>,
+    P: LbPicker<K, S, Req>,
 {
-    type Response = <Balance<D, Req> as Service<Req>>::Response;
-    type Error = <Balance<D, Req> as Service<Req>>::Error;
-    type Future = RespFut<Self::Response>;
+    type Response = BalancerResponse<S::Response>;
+    type Error = BoxError;
+    type Future = BalancerRespFut<S::Response>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.balancer.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Req) -> Self::Future {
-        Box::pin(self.balancer.call(req))
+    fn call(&mut self, req: BalancerRequest<Req>) -> Self::Future {
+        self.balancer.call(req)
     }
 }
 
@@ -77,13 +99,16 @@ where
 /// `ClusterChannel` should be cloned to be used in multi-threaded environment. It leverages a `tower::Buffer` to
 /// queue requests from multiple callers and behind the queue, it load-balances the requests across all
 /// available channels by leveraging the inner `ClusterBalancer` object.
+///
+/// The channel accepts `BalancerRequest<Req>` internally, allowing both real requests
+/// and discovery polling to flow through the same buffer.
 pub(crate) struct ClusterChannel<Req, Resp>
 where
     Req: Send + 'static,
     Resp: 'static,
 {
     // The mpsc channel between callers and the actual pool of channels.
-    svc: Buffer<Req, BoxFuture<Result<Resp, BoxError>>>,
+    svc: Buffer<BalancerRequest<Req>, BalancerRespFut<Resp>>,
 }
 
 impl<Req, Resp> Clone for ClusterChannel<Req, Resp>
@@ -101,22 +126,42 @@ where
 impl<Req, Resp> ClusterChannel<Req, Resp>
 where
     Req: Send + 'static,
-    Resp: 'static,
+    Resp: Send + 'static,
 {
-    /// Creates a new `ClusterChannel` with the given service and picker.
+    /// Creates a new `ClusterChannel` with the given balancer.
     pub(crate) fn from_balancer<B>(balancer: B, buffer_cap: usize) -> Self
     where
-        B: Service<Req, Error = BoxError, Future = RespFut<Resp>> + Send + 'static,
+        B: Service<BalancerRequest<Req>, Response = BalancerResponse<Resp>, Error = BoxError, Future = BalancerRespFut<Resp>>
+            + Send
+            + 'static,
     {
         let svc = Buffer::new(balancer, buffer_cap);
         Self { svc }
+    }
+
+    /// Triggers discovery polling on the load balancer.
+    ///
+    /// This sends a `PollDiscover` request through the buffer, which causes
+    /// the balancer to poll the endpoint discover and apply any pending updates.
+    #[allow(dead_code)]
+    pub(crate) async fn poll_discover(&mut self) -> Result<PollDiscoverResponse, BoxError> {
+        // Ensure the service is ready
+        std::future::poll_fn(|cx| Service::poll_ready(&mut self.svc, cx))
+            .await
+            .map_err(BoxError::from)?;
+
+        let response = self.svc.call(BalancerRequest::PollDiscover).await?;
+        match response {
+            BalancerResponse::PollDiscover(r) => Ok(r),
+            BalancerResponse::Call(_) => unreachable!("PollDiscover should return PollDiscover response"),
+        }
     }
 }
 
 impl<Req, Resp> Service<Req> for ClusterChannel<Req, Resp>
 where
     Req: Send + 'static,
-    Resp: 'static,
+    Resp: Send + 'static,
 {
     type Response = Resp;
     type Error = BoxError;
@@ -127,7 +172,16 @@ where
     }
 
     fn call(&mut self, request: Req) -> Self::Future {
-        Box::pin(self.svc.call(request))
+        let fut = self.svc.call(BalancerRequest::Call(request));
+        Box::pin(async move {
+            let response = fut.await?;
+            match response {
+                BalancerResponse::Call(r) => Ok(r),
+                BalancerResponse::PollDiscover(_) => {
+                    unreachable!("Call should return Call response")
+                }
+            }
+        })
     }
 }
 
@@ -152,19 +206,17 @@ impl Debug for ClusterClient<(), ()> {
 impl<Req, Resp> ClusterClient<Req, Resp>
 where
     Req: Send + 'static,
-    Resp: 'static,
+    Resp: Send + 'static,
 {
-    /// Creates a new `ClusterClient` with the given cluster name and service discovery implementation.
-    /// Currently, `tower::discover::Discover` is used for service discovery.
-    pub(crate) fn new<D>(name: String, discover: D) -> Self
+    /// Creates a new `ClusterClient` with the given cluster name and endpoint discovery implementation.
+    pub(crate) fn new<K, S, D>(name: String, discover: D) -> Self
     where
-        D: Discover + Unpin + Send + 'static,
-        D::Key: std::hash::Hash + Clone + Send,
-        D::Error: Into<BoxError>,
-        D::Service: Service<Req, Response = Resp> + Load + Send + 'static,
-        <D::Service as Load>::Metric: std::fmt::Debug,
-        <D::Service as Service<Req>>::Error: Into<BoxError>,
-        <D::Service as Service<Req>>::Future: Send + 'static,
+        K: Hash + Eq + Clone + Send + 'static,
+        S: Service<Req, Response = Resp> + Load + Send + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+        <S as Load>::Metric: PartialOrd + Send,
+        D: EndpointDiscover<K, S> + Send + 'static,
     {
         let balancer = ClusterBalancer::new(discover);
         let channel = ClusterChannel::from_balancer(balancer, DEFAULT_BUFFER_CAPACITY);
@@ -196,7 +248,7 @@ where
 impl<Req, Resp> ClusterClientRegistry<Req, Resp>
 where
     Req: Send + 'static,
-    Resp: 'static,
+    Resp: Send + 'static,
 {
     /// Creates a new `ClusterClientRegistry`.
     pub(crate) fn new() -> Self {
@@ -204,21 +256,21 @@ where
             registry: DashMap::new(),
         }
     }
+
     /// Get the client of a cluster with lazy discovery.
-    pub(crate) fn get_cluster<F, D>(
+    pub(crate) fn get_cluster<K, S, F, D>(
         &self,
         key: &str,
         discover_fn: F,
     ) -> Arc<ClusterClient<Req, Resp>>
     where
         F: FnOnce() -> D,
-        D: Discover + Unpin + Send + 'static,
-        D::Key: std::hash::Hash + Clone + Send,
-        D::Error: Into<BoxError>,
-        D::Service: Service<Req, Response = Resp> + Load + Send + 'static,
-        <D::Service as Load>::Metric: std::fmt::Debug,
-        <D::Service as Service<Req>>::Error: Into<BoxError>,
-        <D::Service as Service<Req>>::Future: Send + 'static,
+        K: Hash + Eq + Clone + Send + 'static,
+        S: Service<Req, Response = Resp> + Load + Send + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+        <S as Load>::Metric: PartialOrd + Send,
+        D: EndpointDiscover<K, S> + Send + 'static,
     {
         let client = self
             .registry
@@ -236,7 +288,7 @@ where
 impl<Req, Resp> Default for ClusterClientRegistry<Req, Resp>
 where
     Req: Send + 'static,
-    Resp: 'static,
+    Resp: Send + 'static,
 {
     fn default() -> Self {
         Self::new()

@@ -63,12 +63,12 @@ impl<B, Endpoint, S> Service<Request<B>> for XdsLbService<Request<B>, Endpoint, 
 where
     Request<B>: Send + 'static,
     S::Response: Send + 'static,
-    Endpoint: std::hash::Hash + Eq + Clone + Send + Sync + 'static,
-    S: Service<Request<B>> + Load + Send + Sync + 'static,
+    Endpoint: std::hash::Hash + Eq + Clone + Send + 'static,
+    S: Service<Request<B>> + Load + Send + 'static,
     S::Response: Send + 'static,
     S::Error: Into<BoxError>,
     S::Future: Send,
-    <S as Load>::Metric: PartialOrd,
+    <S as Load>::Metric: PartialOrd + Send,
 {
     type Response = S::Response;
     type Error = BoxError;

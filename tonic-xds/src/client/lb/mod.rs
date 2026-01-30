@@ -12,6 +12,9 @@ mod balancer;
 mod discover;
 mod service;
 
-pub(crate) use balancer::{EndpointChangeType, LbPicker, LoadBalancer, P2cPicker};
+pub(crate) use balancer::{
+    BalancerRequest, BalancerResponse, EndpointChangeType, LbPicker, LoadBalancer, P2cPicker,
+    PollDiscoverResponse,
+};
 pub(crate) use discover::{EndpointDiscover, EndpointUpdate, EndpointUpdateCache};
 pub(crate) use service::{LoadBalancingError, XdsLbService};
