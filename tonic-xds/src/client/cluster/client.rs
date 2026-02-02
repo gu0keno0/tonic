@@ -8,69 +8,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::body::Body as TonicBody;
-use tower::{
-    balance::p2c::Balance, buffer::Buffer, discover::Discover, load::Load, BoxError, Service,
-};
+use tower::{buffer::Buffer, discover::Discover, load::Load, BoxError, Service};
+
+use super::loadbalance::ClusterLoadBalancer;
+use super::picker::P2cPicker;
 
 type RespFut<Resp> = BoxFuture<Result<Resp, BoxError>>;
 
 const DEFAULT_BUFFER_CAPACITY: usize = 1024;
-
-/// `ClusterBalancer` is responsible for managing load balancing requests across multiple channels.
-/// Currently, `ClusterBalancer` leverges `tower::balance::p2c` for doing P2C load balancing. In the future, we will
-/// support more load balancing strategies as needed.
-pub(crate) struct ClusterBalancer<D, Req>
-where
-    D: Discover,
-    D::Key: Hash,
-{
-    balancer: Balance<D, Req>,
-}
-
-impl<D, Req> ClusterBalancer<D, Req>
-where
-    D: Discover,
-    D::Key: Hash,
-    D::Service: Service<Req>,
-    <D::Service as Service<Req>>::Error: Into<BoxError>,
-{
-    /// Creates a new `ClusterBalancer` with provided service discovery.
-    pub(crate) fn new(discover: D) -> Self {
-        Self {
-            balancer: Balance::new(discover),
-        }
-    }
-
-    /// Returns the number of endpoints currently tracked by the balancer.
-    /// This can be useful for monitoring and debugging purposes.
-    #[allow(dead_code)]
-    pub(crate) fn len(&self) -> usize {
-        self.balancer.len()
-    }
-}
-
-impl<D, Req> Service<Req> for ClusterBalancer<D, Req>
-where
-    D: Discover + Unpin,
-    D::Key: Hash + Clone,
-    D::Error: Into<BoxError>,
-    D::Service: Service<Req> + Load,
-    <D::Service as Load>::Metric: std::fmt::Debug,
-    <D::Service as Service<Req>>::Error: Into<BoxError> + 'static,
-    <D::Service as Service<Req>>::Future: Send + 'static,
-{
-    type Response = <Balance<D, Req> as Service<Req>>::Response;
-    type Error = <Balance<D, Req> as Service<Req>>::Error;
-    type Future = RespFut<Self::Response>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.balancer.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: Req) -> Self::Future {
-        Box::pin(self.balancer.call(req))
-    }
-}
 
 /// `ClusterChannel` is similar to `tonic::transport::Channel`, but is for load-balancing across all
 /// the channels for a xDS Cluster.
@@ -159,14 +104,16 @@ where
     pub(crate) fn new<D>(name: String, discover: D) -> Self
     where
         D: Discover + Unpin + Send + 'static,
-        D::Key: std::hash::Hash + Clone + Send,
+        D::Key: Hash + Eq + Clone + Send + 'static,
         D::Error: Into<BoxError>,
-        D::Service: Service<Req, Response = Resp> + Load + Send + 'static,
-        <D::Service as Load>::Metric: std::fmt::Debug,
-        <D::Service as Service<Req>>::Error: Into<BoxError>,
-        <D::Service as Service<Req>>::Future: Send + 'static,
+        D::Service: Service<Req, Response = Resp> + Load + Clone + Send + 'static,
+        <D::Service as Load>::Metric: PartialOrd,
+        <D::Service as Service<Req>>::Error: Into<BoxError> + Send,
+        <D::Service as Service<Req>>::Future: Send,
+        Resp: Send,
     {
-        let balancer = ClusterBalancer::new(discover);
+        let picker = P2cPicker::new();
+        let balancer = ClusterLoadBalancer::new(discover, picker);
         let channel = ClusterChannel::from_balancer(balancer, DEFAULT_BUFFER_CAPACITY);
         Self { name, channel }
     }
@@ -213,12 +160,13 @@ where
     where
         F: FnOnce() -> D,
         D: Discover + Unpin + Send + 'static,
-        D::Key: std::hash::Hash + Clone + Send,
+        D::Key: Hash + Eq + Clone + Send + 'static,
         D::Error: Into<BoxError>,
-        D::Service: Service<Req, Response = Resp> + Load + Send + 'static,
-        <D::Service as Load>::Metric: std::fmt::Debug,
-        <D::Service as Service<Req>>::Error: Into<BoxError>,
-        <D::Service as Service<Req>>::Future: Send + 'static,
+        D::Service: Service<Req, Response = Resp> + Load + Clone + Send + 'static,
+        <D::Service as Load>::Metric: PartialOrd,
+        <D::Service as Service<Req>>::Error: Into<BoxError> + Send,
+        <D::Service as Service<Req>>::Future: Send,
+        Resp: Send,
     {
         let client = self
             .registry

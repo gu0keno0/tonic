@@ -89,11 +89,11 @@ where
     B: Send + 'static,
     Request<B>: Send + 'static,
     Endpoint: std::hash::Hash + Eq + Clone + Send + 'static,
-    S: Service<Request<B>> + Load + Send + 'static,
+    S: Service<Request<B>> + Load + Clone + Send + 'static,
     S::Response: Send + 'static,
-    S::Error: Into<BoxError>,
+    S::Error: Into<BoxError> + Send,
     S::Future: Send,
-    <S as tower::load::Load>::Metric: std::fmt::Debug,
+    <S as tower::load::Load>::Metric: PartialOrd,
 {
     type Response = S::Response;
     type Error = BoxError;
