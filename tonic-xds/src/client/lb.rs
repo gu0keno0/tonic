@@ -1,4 +1,5 @@
 use crate::client::cluster::ClusterClientRegistry;
+use crate::client::endpoint::OutlierDetectionStats;
 use crate::common::async_util::BoxFuture;
 use crate::xds::route::RouteDecision;
 use crate::xds::xds_manager::XdsClusterDiscovery;
@@ -64,7 +65,7 @@ where
     Request<B>: Send + 'static,
     S::Response: Send + 'static,
     Endpoint: std::hash::Hash + Eq + Clone + Send + 'static,
-    S: Service<Request<B>> + Load + Clone + Send + 'static,
+    S: Service<Request<B>> + Load + OutlierDetectionStats + Clone + Send + 'static,
     S::Response: Send + 'static,
     S::Error: Into<BoxError> + Send,
     S::Future: Send,

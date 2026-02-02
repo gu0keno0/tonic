@@ -1,6 +1,6 @@
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use tower::load::Load;
 
@@ -11,6 +11,10 @@ pub enum EndpointChange<K> {
     Insert(K),
     /// An endpoint was removed.
     Remove(K),
+    /// An endpoint was ejected due to outlier detection.
+    Eject(K),
+    /// An endpoint was restored after ejection period expired.
+    Uneject(K),
 }
 
 /// A trait for selecting endpoints from a set of available services.
@@ -26,8 +30,15 @@ pub trait Picker<S> {
 
     /// Pick an endpoint from the available set.
     ///
-    /// Returns `None` if no endpoints are available.
-    fn pick(&mut self, services: &HashMap<Self::Key, S>) -> Option<Self::Key>;
+    /// The `ejected` set contains endpoints that should be skipped due to
+    /// outlier detection.
+    ///
+    /// Returns `None` if no non-ejected endpoints are available.
+    fn pick(
+        &mut self,
+        services: &HashMap<Self::Key, S>,
+        ejected: &HashSet<Self::Key>,
+    ) -> Option<Self::Key>;
 }
 
 /// Power of Two Choices (P2C) picker.
@@ -74,13 +85,23 @@ where
             EndpointChange::Remove(k) => {
                 self.keys.retain(|x| x != &k);
             }
+            // Eject/Uneject are handled via the ejected set passed to pick()
+            // The picker doesn't need to maintain separate state for these
+            EndpointChange::Eject(_) | EndpointChange::Uneject(_) => {}
         }
     }
 
-    fn pick(&mut self, services: &HashMap<K, S>) -> Option<K> {
-        match self.keys.len() {
+    fn pick(
+        &mut self,
+        services: &HashMap<K, S>,
+        ejected: &HashSet<K>,
+    ) -> Option<K> {
+        // Filter to non-ejected keys
+        let available: Vec<&K> = self.keys.iter().filter(|k| !ejected.contains(*k)).collect();
+
+        match available.len() {
             0 => None,
-            1 => Some(self.keys[0].clone()),
+            1 => Some(available[0].clone()),
             len => {
                 // Pick two random indices
                 let idx1 = self.rng.gen_range(0..len);
@@ -91,8 +112,8 @@ where
                     }
                 };
 
-                let k1 = &self.keys[idx1];
-                let k2 = &self.keys[idx2];
+                let k1 = available[idx1];
+                let k2 = available[idx2];
 
                 let load1 = services.get(k1).map(|s| s.load());
                 let load2 = services.get(k2).map(|s| s.load());

@@ -29,6 +29,7 @@ dashmap = "6.1"
 thiserror = "2.0.17"
 url = "2.5.8"
 futures-core = "0.3.31"
+tokio = { version = "1", features = ["sync"] }
 
 [lints]
 workspace = true

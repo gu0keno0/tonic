@@ -37,6 +37,30 @@ impl From<SocketAddr> for EndpointAddress {
     }
 }
 
+/// Trait for tracking call outcomes for outlier detection.
+///
+/// Implemented by endpoint services to track success/failure counts.
+/// Similar to the `Load` trait but for outlier detection purposes.
+pub trait OutlierDetectionStats: Send + Sync {
+    /// Record a successful call.
+    fn record_success(&self);
+
+    /// Record a failed call.
+    fn record_failure(&self);
+
+    /// Get the current failure rate (0.0 to 1.0).
+    fn failure_rate(&self) -> f64;
+
+    /// Get the total number of requests tracked.
+    fn request_volume(&self) -> u64;
+
+    /// Get the current consecutive failure count.
+    fn consecutive_failures(&self) -> u64;
+
+    /// Reset the stats (called when unejected).
+    fn reset_stats(&self);
+}
+
 /// RAII tracker for in-flight requests.
 /// This is mainly used to implement endpoint load reporting for load balancing purposes.
 #[derive(Clone, Debug, Default)]
@@ -57,10 +81,15 @@ impl Drop for InFlightTracker {
     }
 }
 
-/// An endpoint channel for communicating with a single gRPC endpoint, with load reporting support for load balancing.
+/// An endpoint channel for communicating with a single gRPC endpoint,
+/// with load reporting and outlier detection stats support.
 pub(crate) struct EndpointChannel<S> {
     inner: S,
     in_flight: Arc<AtomicU64>,
+    // Outlier detection stats
+    successes: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    consecutive_failures: Arc<AtomicU64>,
 }
 
 impl<S> EndpointChannel<S> {
@@ -71,6 +100,9 @@ impl<S> EndpointChannel<S> {
         Self {
             inner,
             in_flight: Arc::new(AtomicU64::new(0)),
+            successes: Arc::new(AtomicU64::new(0)),
+            failures: Arc::new(AtomicU64::new(0)),
+            consecutive_failures: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -83,6 +115,9 @@ where
         Self {
             inner: self.inner.clone(),
             in_flight: self.in_flight.clone(),
+            successes: self.successes.clone(),
+            failures: self.failures.clone(),
+            consecutive_failures: self.consecutive_failures.clone(),
         }
     }
 }
@@ -117,5 +152,46 @@ impl<S> Load for EndpointChannel<S> {
     type Metric = u64;
     fn load(&self) -> Self::Metric {
         self.in_flight.load(Ordering::Relaxed)
+    }
+}
+
+impl<S> OutlierDetectionStats for EndpointChannel<S>
+where
+    S: Send + Sync,
+{
+    fn record_success(&self) {
+        self.successes.fetch_add(1, Ordering::Relaxed);
+        // Reset consecutive failures on success
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn failure_rate(&self) -> f64 {
+        let s = self.successes.load(Ordering::Relaxed);
+        let f = self.failures.load(Ordering::Relaxed);
+        let total = s + f;
+        if total == 0 {
+            0.0
+        } else {
+            f as f64 / total as f64
+        }
+    }
+
+    fn request_volume(&self) -> u64 {
+        self.successes.load(Ordering::Relaxed) + self.failures.load(Ordering::Relaxed)
+    }
+
+    fn consecutive_failures(&self) -> u64 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    fn reset_stats(&self) {
+        self.successes.store(0, Ordering::Relaxed);
+        self.failures.store(0, Ordering::Relaxed);
+        self.consecutive_failures.store(0, Ordering::Relaxed);
     }
 }

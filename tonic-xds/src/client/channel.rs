@@ -1,4 +1,4 @@
-use crate::client::endpoint::{EndpointAddress, EndpointChannel};
+use crate::client::endpoint::{EndpointAddress, EndpointChannel, OutlierDetectionStats};
 use crate::client::lb::XdsLbService;
 use crate::client::route::XdsRoutingService;
 use crate::common::async_util::BoxFuture;
@@ -89,7 +89,7 @@ where
     B: Send + 'static,
     Request<B>: Send + 'static,
     Endpoint: std::hash::Hash + Eq + Clone + Send + 'static,
-    S: Service<Request<B>> + Load + Clone + Send + 'static,
+    S: Service<Request<B>> + Load + OutlierDetectionStats + Clone + Send + 'static,
     S::Response: Send + 'static,
     S::Error: Into<BoxError> + Send,
     S::Future: Send,
@@ -379,6 +379,139 @@ mod tests {
             "Total server requests ({total_server_requests}) should equal successful requests ({successful_requests}). Server counts: {server_counts:?}",
         );
 
+        for server in servers {
+            let _ = server.shutdown.send(());
+            let _ = server.handle.await;
+        }
+    }
+
+    #[tokio::test]
+    /// Tests outlier detection: a faulty server should be ejected after consecutive failures.
+    async fn test_outlier_detection_ejects_faulty_server() {
+        use crate::client::cluster::{
+            ClusterClient, GrpcOutlierDetector, OutlierDetectionConfig,
+        };
+        use crate::testutil::grpc::{spawn_faulty_greeter_server, spawn_greeter_server, GreeterClient, HelloRequest};
+        use http::Request;
+        use std::time::Duration;
+        use tonic::body::Body as TonicBody;
+        use tower::util::BoxCloneService;
+
+        // Create 3 healthy servers and 1 faulty server (always returns errors)
+        let mut servers = Vec::new();
+        for i in 0..3 {
+            let server = spawn_greeter_server(&format!("healthy-{i}"), None, None)
+                .await
+                .expect("Failed to spawn healthy server");
+            servers.push(server);
+        }
+
+        let faulty_server = spawn_faulty_greeter_server("faulty", None) // None = always fail
+            .await
+            .expect("Failed to spawn faulty server");
+        servers.push(faulty_server);
+
+        // Create endpoints for discovery
+        let endpoints: Vec<_> = servers
+            .iter()
+            .map(|s| {
+                let addr = EndpointAddress::from(s.addr);
+                (addr, s.channel.clone())
+            })
+            .collect();
+
+        // Create discovery stream
+        type DiscoverResult = Result<Change<EndpointAddress, EndpointChannel<Channel>>, tower::BoxError>;
+        let (tx, rx) = mpsc::channel::<DiscoverResult>(16);
+        tokio::spawn({
+            let endpoints = endpoints.clone();
+            async move {
+                for (addr, channel) in endpoints {
+                    let endpoint_channel = EndpointChannel::new(channel);
+                    let change: DiscoverResult = Ok(Change::Insert(addr, endpoint_channel));
+                    tx.send(change).await.expect("Failed to send");
+                }
+            }
+        });
+        let discover = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+        // Create outlier detector with low thresholds for testing
+        let config = OutlierDetectionConfig {
+            consecutive_failures_threshold: 3, // Eject after 3 consecutive failures
+            base_ejection_time: Duration::from_secs(60), // Keep ejected for test duration
+            ..Default::default()
+        };
+        let outlier_detector = GrpcOutlierDetector::new(config);
+
+        // Create cluster client with outlier detection
+        let cluster_client: ClusterClient<Request<TonicBody>, http::Response<TonicBody>> =
+            ClusterClient::new_with_outlier_detector(
+                "test-cluster".to_string(),
+                discover,
+                outlier_detector,
+            );
+
+        // Wrap in BoxCloneService to make it compatible with GreeterClient
+        let channel: XdsChannelGrpc = BoxCloneService::new(cluster_client.channel());
+        let mut client = GreeterClient::new(channel);
+
+        // Send requests and track results
+        let num_requests = 100;
+        let mut successful = 0;
+        let mut failed = 0;
+        let mut server_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for i in 0..num_requests {
+            let result = client.say_hello(HelloRequest {
+                name: format!("test-{i}"),
+            }).await;
+
+            match result {
+                Ok(response) => {
+                    successful += 1;
+                    // Extract server name from response (format: "server-name: test-N")
+                    let message = response.into_inner().message;
+                    if let Some(server_name) = message.split(':').next() {
+                        *server_counts.entry(server_name.to_string()).or_insert(0) += 1;
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    if i < 10 {
+                        println!("Request {i} failed: {e}");
+                    }
+                }
+            }
+
+            // Small delay to allow outlier detection to process
+            if i < 10 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        println!("Successful requests: {successful}");
+        println!("Failed requests: {failed}");
+        println!("Server counts: {server_counts:?}");
+
+        // After outlier detection kicks in (after ~3 failures to faulty server),
+        // most requests should succeed.
+        // With 4 servers (3 healthy, 1 faulty), initially ~25% would fail.
+        // After ejection, 0% should fail (to healthy servers).
+        // So we expect high success rate overall.
+        let success_rate = successful as f64 / num_requests as f64;
+        println!("Success rate: {:.1}%", success_rate * 100.0);
+
+        // We expect at least 90% success rate after outlier detection ejects the faulty server.
+        // The first few requests might hit the faulty server before it's ejected.
+        assert!(
+            success_rate >= 0.90,
+            "Expected at least 90% success rate with outlier detection, got {:.1}%. \
+             The faulty server should have been ejected after consecutive failures.",
+            success_rate * 100.0
+        );
+
+        // Cleanup
         for server in servers {
             let _ = server.shutdown.send(());
             let _ = server.handle.await;

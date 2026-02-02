@@ -1,3 +1,4 @@
+use crate::client::endpoint::OutlierDetectionStats;
 use crate::common::async_util::BoxFuture;
 use dashmap::DashMap;
 use http::{Request, Response};
@@ -11,6 +12,7 @@ use tonic::body::Body as TonicBody;
 use tower::{buffer::Buffer, discover::Discover, load::Load, BoxError, Service};
 
 use super::loadbalance::ClusterLoadBalancer;
+use super::outlier::OutlierDetector;
 use super::picker::P2cPicker;
 
 type RespFut<Resp> = BoxFuture<Result<Resp, BoxError>>;
@@ -106,7 +108,8 @@ where
         D: Discover + Unpin + Send + 'static,
         D::Key: Hash + Eq + Clone + Send + 'static,
         D::Error: Into<BoxError>,
-        D::Service: Service<Req, Response = Resp> + Load + Clone + Send + 'static,
+        D::Service:
+            Service<Req, Response = Resp> + Load + OutlierDetectionStats + Clone + Send + 'static,
         <D::Service as Load>::Metric: PartialOrd,
         <D::Service as Service<Req>>::Error: Into<BoxError> + Send,
         <D::Service as Service<Req>>::Future: Send,
@@ -114,6 +117,26 @@ where
     {
         let picker = P2cPicker::new();
         let balancer = ClusterLoadBalancer::new(discover, picker);
+        let channel = ClusterChannel::from_balancer(balancer, DEFAULT_BUFFER_CAPACITY);
+        Self { name, channel }
+    }
+
+    /// Creates a new `ClusterClient` with outlier detection enabled.
+    pub(crate) fn new_with_outlier_detector<D, O>(name: String, discover: D, outlier_detector: O) -> Self
+    where
+        D: Discover + Unpin + Send + 'static,
+        D::Key: Hash + Eq + Clone + Send + 'static,
+        D::Error: Into<BoxError>,
+        D::Service:
+            Service<Req, Response = Resp> + Load + OutlierDetectionStats + Clone + Send + 'static,
+        <D::Service as Load>::Metric: PartialOrd,
+        <D::Service as Service<Req>>::Error: Into<BoxError> + Send,
+        <D::Service as Service<Req>>::Future: Send,
+        Resp: Send + 'static,
+        O: OutlierDetector<Key = D::Key, Result = Result<Resp, BoxError>> + Send + 'static,
+    {
+        let picker = P2cPicker::new();
+        let balancer = ClusterLoadBalancer::with_outlier_detector(discover, picker, outlier_detector);
         let channel = ClusterChannel::from_balancer(balancer, DEFAULT_BUFFER_CAPACITY);
         Self { name, channel }
     }
@@ -162,7 +185,8 @@ where
         D: Discover + Unpin + Send + 'static,
         D::Key: Hash + Eq + Clone + Send + 'static,
         D::Error: Into<BoxError>,
-        D::Service: Service<Req, Response = Resp> + Load + Clone + Send + 'static,
+        D::Service:
+            Service<Req, Response = Resp> + Load + OutlierDetectionStats + Clone + Send + 'static,
         <D::Service as Load>::Metric: PartialOrd,
         <D::Service as Service<Req>>::Error: Into<BoxError> + Send,
         <D::Service as Service<Req>>::Future: Send,
