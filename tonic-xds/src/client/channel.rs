@@ -12,8 +12,11 @@ use tower::{load::Load, util::BoxCloneService, BoxError, Service};
 
 #[cfg(test)]
 use {
-    crate::client::cluster::ClusterClientRegistryGrpc, crate::client::route::XdsRoutingLayer,
-    crate::xds::xds_manager::XdsManager, tower::ServiceBuilder,
+    crate::client::cluster::ClusterClientRegistryGrpc,
+    crate::client::retry::{ConnectionRetryConfig, ConnectionRetryLayer},
+    crate::client::route::XdsRoutingLayer,
+    crate::xds::xds_manager::XdsManager,
+    tower::ServiceBuilder,
 };
 
 /// Configuration for building [`XdsChannel`] / [`XdsChannelGrpc`].
@@ -181,6 +184,26 @@ impl XdsChannelBuilder {
             config: self.config.clone(),
             inner: service,
         })
+    }
+
+    /// Builds an `XdsChannelGrpc` with a retry layer for connection errors.
+    /// Retry is placed after routing so it only retries the load-balanced call.
+    #[cfg(test)]
+    pub(crate) fn build_grpc_channel_with_retry(
+        &self,
+        xds_manager: Arc<dyn XdsManager<EndpointAddress, EndpointChannel<Channel>>>,
+        retry_config: ConnectionRetryConfig,
+    ) -> XdsChannelGrpc {
+        let routing_layer = XdsRoutingLayer::new(xds_manager.clone());
+        let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
+        let lb_service = XdsLbService::new(cluster_registry, xds_manager.clone());
+        // Build service stack: routing -> retry -> lb
+        // Retry is after routing so xDS routing config can control retry behavior
+        let service = ServiceBuilder::new()
+            .layer(routing_layer)
+            .layer(ConnectionRetryLayer::new(retry_config))
+            .service(lb_service);
+        BoxCloneService::new(service)
     }
 }
 
@@ -512,6 +535,101 @@ mod tests {
         );
 
         // Cleanup
+        for server in servers {
+            let _ = server.shutdown.send(());
+            let _ = server.handle.await;
+        }
+    }
+
+    #[tokio::test]
+    /// Tests that retry layer handles server shutdown gracefully.
+    /// When a server goes down, the retry layer should retry on another server,
+    /// resulting in no e2e failures visible to the client.
+    async fn test_retry_on_server_down() {
+        use crate::client::retry::ConnectionRetryConfig;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let num_servers = 3;
+        let (_, mut servers) = setup_grpc_servers(num_servers).await;
+
+        // Create a mock XdsManager with the test servers
+        let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
+
+        // Create retry counter to track retries
+        let retry_counter = Arc::new(AtomicU64::new(0));
+        // With 2 alive servers and 1 dead, probability of hitting dead server is 1/3.
+        // With max_retries=10, probability of all 11 attempts hitting dead is (1/3)^11 ≈ 0
+        let retry_config = ConnectionRetryConfig::with_counter(10, retry_counter.clone());
+
+        let xds_channel_builder = XdsChannelBuilder::with_config(XdsChannelConfig::default());
+        let xds_channel = xds_channel_builder
+            .build_grpc_channel_with_retry(xds_manager.clone(), retry_config);
+
+        let mut client = GreeterClient::new(xds_channel);
+
+        // Send some requests to warm up and verify all servers work
+        let warmup_requests = 30;
+        for i in 0..warmup_requests {
+            let result = client
+                .say_hello(HelloRequest {
+                    name: format!("warmup-{i}"),
+                })
+                .await;
+            assert!(result.is_ok(), "Warmup request {i} failed: {:?}", result.err());
+        }
+
+        println!("Warmup complete, all {} requests succeeded", warmup_requests);
+        println!("Retries during warmup: {}", retry_counter.load(Ordering::Relaxed));
+
+        // Shut down one server (take ownership by removing from vec)
+        let server_to_shutdown = servers.remove(0);
+        println!("Shutting down server at {}", server_to_shutdown.addr);
+        let _ = server_to_shutdown.shutdown.send(());
+        let _ = server_to_shutdown.handle.await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Reset retry counter
+        retry_counter.store(0, Ordering::Relaxed);
+
+        // Send more requests - some will hit the dead server but retry should save them
+        let num_requests = 100;
+        let mut successful = 0;
+        let mut failed = 0;
+
+        for i in 0..num_requests {
+            let result = client
+                .say_hello(HelloRequest {
+                    name: format!("test-{i}"),
+                })
+                .await;
+            match result {
+                Ok(_) => successful += 1,
+                Err(e) => {
+                    failed += 1;
+                    println!("Request {i} failed: {e}");
+                }
+            }
+        }
+
+        let retries = retry_counter.load(Ordering::Relaxed);
+        println!("Successful requests: {successful}");
+        println!("Failed requests: {failed}");
+        println!("Retries triggered: {retries}");
+
+        // With retry layer, we expect:
+        // 1. Retries to have occurred (proving we hit the dead server)
+        // 2. All requests to succeed (proving retry worked)
+        assert!(
+            retries > 0,
+            "Expected some retries to occur when hitting dead server, but got 0 retries"
+        );
+        assert_eq!(
+            failed, 0,
+            "Expected 0 failures with retry layer, but got {failed}. \
+             Retry should have saved requests that hit the dead server."
+        );
+
+        // Cleanup remaining servers
         for server in servers {
             let _ = server.shutdown.send(());
             let _ = server.handle.await;

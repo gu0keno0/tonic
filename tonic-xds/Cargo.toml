@@ -23,13 +23,15 @@ exclude = ["proto/test/*"]
 [dependencies]
 tonic = "0.14"
 http = "1"
-tower = { version = "0.5", default-features = false, features = ["discover", "load"] }
+tower = { version = "0.5", default-features = false, features = ["discover", "load", "retry", "util"] }
 rand = { version = "0.8", features = ["small_rng"] }
 dashmap = "6.1"
 thiserror = "2.0.17"
 url = "2.5.8"
 futures-core = "0.3.31"
 tokio = { version = "1", features = ["sync"] }
+bytes = "1"
+http-body-util = "0.1"
 
 [lints]
 workspace = true
