@@ -61,15 +61,38 @@ impl<S> ConnectionRetryService<S> {
 
 /// Check if an error is a connection error worth retrying.
 fn is_connection_error(e: &BoxError) -> bool {
-    let error_str = format!("{:?}", e);
-    error_str.contains("connection")
-        || error_str.contains("Connection")
-        || error_str.contains("connect error")  // "tcp connect error"
-        || error_str.contains("refused")
-        || error_str.contains("reset")
-        || error_str.contains("broken pipe")
-        || error_str.contains("os error 111") // ECONNREFUSED on Linux
-        || error_str.contains("os error 61") // ECONNREFUSED on macOS
+    // Walk the error chain looking for connection-related errors
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
+    while let Some(err) = current {
+        // Check for tonic::ConnectError (most direct indicator)
+        if err.downcast_ref::<tonic::ConnectError>().is_some() {
+            return true;
+        }
+
+        // Check for tonic::Status with UNAVAILABLE code
+        if let Some(status) = err.downcast_ref::<tonic::Status>() {
+            if status.code() == tonic::Code::Unavailable {
+                return true;
+            }
+        }
+
+        // Check for std::io::Error with connection-related kinds
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) {
+                return true;
+            }
+        }
+
+        current = err.source();
+    }
+
+    false
 }
 
 impl<S> Service<Request<TonicBody>> for ConnectionRetryService<S>
@@ -99,7 +122,7 @@ where
             let body_bytes = body
                 .collect()
                 .await
-                .map_err(|e| BoxError::from(format!("failed to buffer body: {}", e)))?
+                .map_err(|e| BoxError::from(format!("failed to buffer body: {e}")))?
                 .to_bytes();
 
             let mut last_error: Option<BoxError> = None;
@@ -158,11 +181,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_connection_error() {
-        assert!(is_connection_error(&BoxError::from("connection refused")));
-        assert!(is_connection_error(&BoxError::from("Connection reset")));
-        assert!(is_connection_error(&BoxError::from("os error 61")));
-        assert!(!is_connection_error(&BoxError::from("grpc status: unavailable")));
-        assert!(!is_connection_error(&BoxError::from("timeout")));
+    fn test_is_connection_error_io_errors() {
+        // Test with actual std::io::Error types
+        let conn_refused = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        );
+        assert!(is_connection_error(&BoxError::from(conn_refused)));
+
+        let conn_reset = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        );
+        assert!(is_connection_error(&BoxError::from(conn_reset)));
+
+        let broken_pipe = std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        );
+        assert!(is_connection_error(&BoxError::from(broken_pipe)));
+
+        // Non-connection errors should not trigger retry
+        let timeout = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        );
+        assert!(!is_connection_error(&BoxError::from(timeout)));
+
+        // String errors should not trigger retry
+        assert!(!is_connection_error(&BoxError::from("random error")));
+    }
+
+    #[test]
+    fn test_is_connection_error_tonic_status() {
+        // tonic::Status with UNAVAILABLE should trigger retry
+        let unavailable = tonic::Status::unavailable("service unavailable");
+        assert!(is_connection_error(&BoxError::from(unavailable)));
+
+        // tonic::Status with other codes should not trigger retry
+        let internal = tonic::Status::internal("internal error");
+        assert!(!is_connection_error(&BoxError::from(internal)));
+
+        let invalid_arg = tonic::Status::invalid_argument("bad argument");
+        assert!(!is_connection_error(&BoxError::from(invalid_arg)));
     }
 }

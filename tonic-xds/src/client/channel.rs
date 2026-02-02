@@ -578,7 +578,7 @@ mod tests {
             assert!(result.is_ok(), "Warmup request {i} failed: {:?}", result.err());
         }
 
-        println!("Warmup complete, all {} requests succeeded", warmup_requests);
+        println!("Warmup complete, all {warmup_requests} requests succeeded");
         println!("Retries during warmup: {}", retry_counter.load(Ordering::Relaxed));
 
         // Shut down one server (take ownership by removing from vec)
