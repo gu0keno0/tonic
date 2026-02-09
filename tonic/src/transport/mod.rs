@@ -100,7 +100,7 @@ mod tls;
 
 #[doc(inline)]
 #[cfg(feature = "channel")]
-pub use self::channel::{Channel, Endpoint};
+pub use self::channel::{Channel, ChannelState, Endpoint};
 pub use self::error::Error;
 #[doc(inline)]
 #[cfg(feature = "server")]

@@ -1,3 +1,4 @@
+use super::super::state::{ChannelState, SharedStateTracker};
 use pin_project::pin_project;
 use std::fmt;
 use std::{
@@ -20,6 +21,7 @@ where
     error: Option<crate::BoxError>,
     has_been_connected: bool,
     is_lazy: bool,
+    state_tracker: Option<SharedStateTracker>,
 }
 
 #[derive(Debug)]
@@ -29,12 +31,28 @@ enum State<F, S> {
     Connected(S),
 }
 
+impl<F, S> State<F, S> {
+    /// Returns the ChannelState corresponding to this internal state.
+    fn kind(&self) -> ChannelState {
+        match self {
+            State::Idle => ChannelState::Idle,
+            State::Connecting(_) => ChannelState::Connecting,
+            State::Connected(_) => ChannelState::Connected,
+        }
+    }
+}
+
 impl<M, Target> Reconnect<M, Target>
 where
     M: Service<Target>,
     M::Error: Into<crate::BoxError>,
 {
-    pub(crate) fn new(mk_service: M, target: Target, is_lazy: bool) -> Self {
+    pub(crate) fn new(
+        mk_service: M,
+        target: Target,
+        is_lazy: bool,
+        state_tracker: Option<SharedStateTracker>,
+    ) -> Self {
         Reconnect {
             mk_service,
             state: State::Idle,
@@ -42,6 +60,17 @@ where
             error: None,
             has_been_connected: false,
             is_lazy,
+            state_tracker,
+        }
+    }
+
+    /// Sets the internal state and notifies the tracker.
+    /// All state transitions MUST go through this method to ensure
+    /// the ChannelStateTracker is notified of state changes.
+    fn set_state(&mut self, new_state: State<M::Future, M::Response>) {
+        self.state = new_state;
+        if let Some(ref tracker) = self.state_tracker {
+            tracker.set(self.state.kind());
         }
     }
 }
@@ -79,7 +108,8 @@ where
                     }
 
                     let fut = self.mk_service.make_service(self.target.clone());
-                    self.state = State::Connecting(fut);
+                    // Use set_state to notify tracker
+                    self.set_state(State::Connecting(fut));
                     continue;
                 }
                 State::Connecting(ref mut f) => {
@@ -98,6 +128,8 @@ where
                             state = State::Idle;
 
                             if !(self.has_been_connected || self.is_lazy) {
+                                // Use set_state to notify tracker before returning error
+                                self.set_state(state);
                                 return Poll::Ready(Err(e.into()));
                             } else {
                                 let error = e.into();
@@ -130,10 +162,12 @@ where
                 }
             }
 
-            self.state = state;
+            // Use set_state to notify tracker
+            self.set_state(state);
         }
 
-        self.state = state;
+        // Use set_state to notify tracker
+        self.set_state(state);
         Poll::Ready(Ok(()))
     }
 

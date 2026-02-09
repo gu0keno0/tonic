@@ -1,7 +1,14 @@
 use super::{AddOrigin, Reconnect, SharedExec, UserAgent};
 use crate::{
     body::Body,
-    transport::{channel::BoxFuture, service::GrpcTimeout, Endpoint},
+    transport::{
+        channel::{
+            state::{ChannelState, ChannelStateTracker, SharedStateTracker},
+            BoxFuture,
+        },
+        service::GrpcTimeout,
+        Endpoint,
+    },
 };
 use http::{Request, Response, Uri};
 use hyper::rt;
@@ -9,8 +16,10 @@ use hyper::{client::conn::http2::Builder, rt::Executor};
 use hyper_util::rt::TokioTimer;
 use std::{
     fmt,
+    sync::Arc,
     task::{Context, Poll},
 };
+use tokio::sync::watch;
 use tower::load::Load;
 use tower::{
     layer::Layer,
@@ -22,6 +31,7 @@ use tower_service::Service;
 
 pub(crate) struct Connection {
     inner: BoxService<Request<Body>, Response<Body>, crate::BoxError>,
+    state_rx: watch::Receiver<ChannelState>,
 }
 
 impl Connection {
@@ -32,6 +42,15 @@ impl Connection {
         C::Future: Send,
         C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
     {
+        // Create state tracker for this connection
+        let initial_state = if is_lazy {
+            ChannelState::Idle
+        } else {
+            ChannelState::Connecting
+        };
+        let (tracker, state_rx) = ChannelStateTracker::new(initial_state);
+        let state_tracker: SharedStateTracker = Arc::new(tracker);
+
         let mut settings: Builder<SharedExec> = Builder::new(endpoint.executor.clone())
             .initial_stream_window_size(endpoint.init_stream_window_size)
             .initial_connection_window_size(endpoint.init_connection_window_size)
@@ -67,14 +86,31 @@ impl Connection {
             .option_layer(endpoint.rate_limit.map(|(l, d)| RateLimitLayer::new(l, d)))
             .into_inner();
 
-        let make_service =
-            MakeSendRequestService::new(connector, endpoint.executor.clone(), settings);
+        // Pass state_tracker to MakeSendRequestService for proactive notification
+        let make_service = MakeSendRequestService::new(
+            connector,
+            endpoint.executor.clone(),
+            settings,
+            state_tracker.clone(),
+        );
 
-        let conn = Reconnect::new(make_service, endpoint.uri().clone(), is_lazy);
+        // Pass state_tracker to Reconnect for state transition notifications
+        let conn = Reconnect::new(
+            make_service,
+            endpoint.uri().clone(),
+            is_lazy,
+            Some(state_tracker),
+        );
 
         Self {
             inner: BoxService::new(stack.layer(conn)),
+            state_rx,
         }
+    }
+
+    /// Returns a receiver for observing channel state changes.
+    pub(crate) fn state(&self) -> watch::Receiver<ChannelState> {
+        self.state_rx.clone()
     }
 
     pub(crate) async fn connect<C>(
@@ -159,14 +195,21 @@ struct MakeSendRequestService<C> {
     connector: C,
     executor: SharedExec,
     settings: Builder<SharedExec>,
+    state_tracker: SharedStateTracker,
 }
 
 impl<C> MakeSendRequestService<C> {
-    fn new(connector: C, executor: SharedExec, settings: Builder<SharedExec>) -> Self {
+    fn new(
+        connector: C,
+        executor: SharedExec,
+        settings: Builder<SharedExec>,
+        state_tracker: SharedStateTracker,
+    ) -> Self {
         Self {
             connector,
             executor,
             settings,
+            state_tracker,
         }
     }
 }
@@ -190,15 +233,24 @@ where
         let fut = self.connector.call(req);
         let builder = self.settings.clone();
         let executor = self.executor.clone();
+        let state_tracker = self.state_tracker.clone();
 
         Box::pin(async move {
             let io = fut.await.map_err(Into::into)?;
             let (send_request, conn) = builder.handshake(io).await?;
 
+            // Spawn connection task with state tracker for proactive notification
+            let task_state_tracker = state_tracker.clone();
             Executor::<BoxFuture<'static, ()>>::execute(
                 &executor,
                 Box::pin(async move {
-                    if let Err(e) = conn.await {
+                    let result = conn.await;
+
+                    // Connection died - notify immediately!
+                    // This provides proactive notification before poll_ready is called.
+                    task_state_tracker.set(ChannelState::Idle);
+
+                    if let Err(e) = result {
                         tracing::debug!("connection task error: {:?}", e);
                     }
                 }) as _,

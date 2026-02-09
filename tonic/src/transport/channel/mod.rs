@@ -2,12 +2,14 @@
 
 mod endpoint;
 pub(crate) mod service;
+pub(crate) mod state;
 #[cfg(feature = "_tls-any")]
 mod tls;
 mod uds_connector;
 
 pub use self::service::Change;
 pub use endpoint::Endpoint;
+pub use state::ChannelState;
 #[cfg(feature = "_tls-any")]
 pub use tls::ClientTlsConfig;
 
@@ -25,7 +27,10 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::{
+    mpsc::{channel, Sender},
+    watch,
+};
 
 use hyper::rt;
 use tower::balance::p2c::Balance;
@@ -66,6 +71,9 @@ const DEFAULT_BUFFER_SIZE: usize = 1024;
 #[derive(Clone)]
 pub struct Channel {
     svc: Buffer<Request<Body>, BoxFuture<'static, Result<Response<Body>, crate::BoxError>>>,
+    /// State receiver for single-endpoint channels.
+    /// None for balanced channels (which have multiple underlying connections).
+    state_rx: Option<watch::Receiver<ChannelState>>,
 }
 
 /// A future that resolves to an HTTP response.
@@ -158,12 +166,16 @@ impl Channel {
         let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
         let executor = endpoint.executor.clone();
 
-        let svc = Connection::lazy(connector, endpoint);
-        let (svc, worker) = Buffer::pair(svc, buffer_size);
+        let conn = Connection::lazy(connector, endpoint);
+        let state_rx = conn.state();
+        let (svc, worker) = Buffer::pair(conn, buffer_size);
 
         executor.execute(worker);
 
-        Channel { svc }
+        Channel {
+            svc,
+            state_rx: Some(state_rx),
+        }
     }
 
     /// Connect to the provided [`Endpoint`] using the provided connector, and return a new [`Channel`].
@@ -179,13 +191,17 @@ impl Channel {
         let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
         let executor = endpoint.executor.clone();
 
-        let svc = Connection::connect(connector, endpoint)
+        let conn = Connection::connect(connector, endpoint)
             .await
             .map_err(super::Error::from_source)?;
-        let (svc, worker) = Buffer::pair(svc, buffer_size);
+        let state_rx = conn.state();
+        let (svc, worker) = Buffer::pair(conn, buffer_size);
         executor.execute(worker);
 
-        Ok(Channel { svc })
+        Ok(Channel {
+            svc,
+            state_rx: Some(state_rx),
+        })
     }
 
     pub(crate) fn balance<D, E>(discover: D, buffer_size: usize, executor: E) -> Self
@@ -201,7 +217,41 @@ impl Channel {
         let (svc, worker) = Buffer::pair(svc, buffer_size);
         executor.execute(Box::pin(worker));
 
-        Channel { svc }
+        Channel {
+            svc,
+            state_rx: None,
+        }
+    }
+
+    /// Returns a receiver for observing channel connectivity state changes.
+    ///
+    /// This method returns `Some` for single-endpoint channels created via
+    /// [`Endpoint::connect`] or [`Endpoint::connect_lazy`], and `None` for
+    /// balanced channels created via [`Channel::balance_channel`] or
+    /// [`Channel::balance_list`] (which have multiple underlying connections).
+    ///
+    /// The receiver can be used to:
+    /// - Check the current state with `borrow()`
+    /// - Wait for state changes with `changed().await`
+    /// - Convert to a stream with `tokio_stream::wrappers::WatchStream`
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use tokio_stream::wrappers::WatchStream;
+    /// use tokio_stream::StreamExt;
+    ///
+    /// let channel = endpoint.connect_lazy();
+    /// if let Some(state_rx) = channel.state() {
+    ///     let mut stream = WatchStream::new(state_rx);
+    ///     while let Some(state) = stream.next().await {
+    ///         println!("Channel state: {:?}", state);
+    ///     }
+    /// }
+    /// ```
+    #[doc(hidden)]
+    pub fn state(&self) -> Option<watch::Receiver<ChannelState>> {
+        self.state_rx.clone()
     }
 }
 
