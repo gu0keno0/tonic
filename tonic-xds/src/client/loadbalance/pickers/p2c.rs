@@ -4,7 +4,6 @@ use indexmap::IndexMap;
 use tower::load::Load;
 
 use crate::client::endpoint::EndpointAddress;
-use crate::client::loadbalance::channel_state::ReadyChannel;
 use crate::client::loadbalance::pickers::ChannelPicker;
 
 /// Pick two distinct random indices from `[0, length)` using Floyd's algorithm.
@@ -27,7 +26,7 @@ where
     fn pick(
         &self,
         _req: &Req,
-        ready: &IndexMap<EndpointAddress, ReadyChannel<S>>,
+        ready: &IndexMap<EndpointAddress, S>,
     ) -> Option<usize> {
         let len = ready.len();
         match len {

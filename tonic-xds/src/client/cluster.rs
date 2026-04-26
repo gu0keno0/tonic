@@ -114,7 +114,9 @@ where
         <C::Service as Load>::Metric: PartialOrd,
         P2cPicker: ChannelPicker<C::Service, Req>,
     {
-        let picker: Arc<dyn ChannelPicker<C::Service, Req> + Send + Sync> = Arc::new(P2cPicker);
+        use crate::client::loadbalance::channel_state::ReadyChannel;
+        let picker: Arc<dyn ChannelPicker<ReadyChannel<C::Service>, Req> + Send + Sync> =
+            Arc::new(P2cPicker);
         let lb = LoadBalancer::new(discover, connector, picker);
         // Map LbError → BoxError and box the future to match ClusterChannel's expectations.
         let mapped = tower::util::MapErr::new(lb, |e: LbError| -> BoxError { Box::new(e) });

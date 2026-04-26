@@ -60,7 +60,7 @@ pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     /// Ready-to-serve channels, keyed by endpoint address.
     ready: IndexMap<EndpointAddress, ReadyChannel<C::Service>>,
     /// Channel picker for load balancing.
-    picker: Arc<dyn ChannelPicker<C::Service, Req> + Send + Sync>,
+    picker: Arc<dyn ChannelPicker<ReadyChannel<C::Service>, Req> + Send + Sync>,
 }
 
 impl<D, C, Req> LoadBalancer<D, C, Req>
@@ -74,7 +74,7 @@ where
     pub(crate) fn new(
         discovery: D,
         connector: Arc<C>,
-        picker: Arc<dyn ChannelPicker<C::Service, Req> + Send + Sync>,
+        picker: Arc<dyn ChannelPicker<ReadyChannel<C::Service>, Req> + Send + Sync>,
     ) -> Self {
         Self {
             discovery,
