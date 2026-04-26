@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use indexmap::IndexMap;
-use pin_project_lite::pin_project;
 use tower::discover::{Change, Discover};
 use tower::Service;
 
@@ -20,34 +19,25 @@ use crate::client::loadbalance::errors::LbError;
 use crate::client::loadbalance::keyed_futures::KeyedFutures;
 use crate::client::loadbalance::pickers::ChannelPicker;
 
-pin_project! {
-    /// Future returned by [`LoadBalancer::call`].
-    ///
-    /// Either resolves immediately with an [`LbError`] or delegates to the
-    /// inner service future, mapping its error to [`LbError::ServiceFailure`].
-    #[project = LbFutureProj]
-    pub(crate) enum LbFuture<F> {
-        Error { error: Option<LbError> },
-        Pending { #[pin] inner: F },
-    }
+/// Future returned by [`LoadBalancer::call`].
+///
+/// Either resolves immediately with an [`LbError`], or drives `poll_ready` +
+/// `call` on the selected channel asynchronously.
+pub(crate) enum LbFuture<Resp> {
+    Error(Option<LbError>),
+    Pending(Pin<Box<dyn Future<Output = Result<Resp, LbError>> + Send>>),
 }
 
-impl<F, T, E> Future for LbFuture<F>
-where
-    F: Future<Output = Result<T, E>>,
-    E: Into<tower::BoxError>,
-{
-    type Output = Result<T, LbError>;
+impl<Resp> Future for LbFuture<Resp> {
+    type Output = Result<Resp, LbError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.project() {
-            LbFutureProj::Error { error } => match error.take() {
+        match self.get_mut() {
+            LbFuture::Error(error) => match error.take() {
                 Some(e) => Poll::Ready(Err(e)),
                 None => Poll::Ready(Err(LbError::Precondition("LbFuture::Error polled twice"))),
             },
-            LbFutureProj::Pending { inner } => {
-                inner.poll(cx).map_err(|e| LbError::ServiceFailure(e.into()))
-            }
+            LbFuture::Pending(fut) => fut.as_mut().poll(cx),
         }
     }
 }
@@ -70,7 +60,7 @@ pub(crate) struct LoadBalancer<D, C: Connector, Req> {
     /// Ready-to-serve channels, keyed by endpoint address.
     ready: IndexMap<EndpointAddress, ReadyChannel<C::Service>>,
     /// Channel picker for load balancing.
-    picker: Arc<dyn ChannelPicker<C::Service, Req>>,
+    picker: Arc<dyn ChannelPicker<C::Service, Req> + Send + Sync>,
 }
 
 impl<D, C, Req> LoadBalancer<D, C, Req>
@@ -84,7 +74,7 @@ where
     pub(crate) fn new(
         discovery: D,
         connector: Arc<C>,
-        picker: Arc<dyn ChannelPicker<C::Service, Req>>,
+        picker: Arc<dyn ChannelPicker<C::Service, Req> + Send + Sync>,
     ) -> Self {
         Self {
             discovery,
@@ -102,13 +92,13 @@ where
                 Poll::Ready(Some(Ok(change))) => match change {
                     Change::Insert(addr, idle) => {
                         let _ = self.connecting.cancel(&addr);
-                        self.ready.remove(&addr);
+                        self.ready.swap_remove(&addr);
                         let connecting = idle.connect(self.connector.clone());
                         let _ = self.connecting.add(addr, connecting);
                     }
                     Change::Remove(addr) => {
                         let _ = self.connecting.cancel(&addr);
-                        self.ready.remove(&addr);
+                        self.ready.swap_remove(&addr);
                     }
                 },
                 Poll::Ready(Some(Err(e))) => {
@@ -132,13 +122,15 @@ where
     D: Discover<Key = EndpointAddress, Service = IdleChannel> + Unpin,
     D::Error: std::fmt::Debug,
     C: Connector + Send + Sync + 'static,
-    C::Service: Service<Req> + Send + 'static,
+    C::Service: Service<Req> + Clone + Send + 'static,
+    <C::Service as Service<Req>>::Response: Send + 'static,
     <C::Service as Service<Req>>::Error: Into<tower::BoxError>,
+    <C::Service as Service<Req>>::Future: Send + 'static,
     Req: Send + 'static,
 {
     type Response = <C::Service as Service<Req>>::Response;
     type Error = LbError;
-    type Future = LbFuture<<C::Service as Service<Req>>::Future>;
+    type Future = LbFuture<Self::Response>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.poll_discover(cx);
@@ -148,17 +140,21 @@ where
 
     fn call(&mut self, req: Req) -> Self::Future {
         let Some(idx) = self.picker.pick(&req, &self.ready) else {
-            return LbFuture::Error {
-                error: Some(LbError::Unavailable),
-            };
+            return LbFuture::Error(Some(LbError::Unavailable));
         };
         let Some((_, svc)) = self.ready.get_index_mut(idx) else {
-            return LbFuture::Error {
-                error: Some(LbError::Precondition("picker returned invalid index")),
-            };
+            return LbFuture::Error(Some(LbError::Precondition(
+                "picker returned invalid index",
+            )));
         };
-        LbFuture::Pending {
-            inner: svc.call(req),
-        }
+        let mut svc = svc.clone();
+        LbFuture::Pending(Box::pin(async move {
+            tower::ServiceExt::ready(&mut svc)
+                .await
+                .map_err(|_| LbError::LbChannelNotReady)?;
+            svc.call(req)
+                .await
+                .map_err(|e| LbError::LbChannelError(e.into()))
+        }))
     }
 }
