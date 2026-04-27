@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tonic::transport::{Channel, Endpoint};
 
-use crate::client::endpoint::{Connector, EndpointAddress};
+use crate::client::endpoint::{Connector, EndpointAddress, MakeConnector};
 use crate::client::lb::{BoxDiscover, ClusterDiscovery};
 use crate::client::loadbalance::channel::LbChannel;
 use crate::common::async_util::BoxFuture;
@@ -56,5 +56,18 @@ impl Connector for DefaultConnector {
             .expect("EndpointAddress Display guarantees valid URI")
             .connect_lazy();
         Box::pin(std::future::ready(LbChannel::new(addr.clone(), channel)))
+    }
+}
+
+/// Default [`MakeConnector`] that returns the same [`DefaultConnector`] for
+/// every cluster. Suitable for plaintext (non-TLS) connections.
+pub(crate) struct DefaultMakeConnector;
+
+impl MakeConnector for DefaultMakeConnector {
+    type Service = LbChannel<Channel>;
+    type Connector = DefaultConnector;
+
+    fn make_connector(&self, _cluster_name: &str) -> Arc<Self::Connector> {
+        Arc::new(DefaultConnector)
     }
 }

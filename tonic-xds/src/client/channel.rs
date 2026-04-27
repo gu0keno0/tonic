@@ -4,7 +4,7 @@ use crate::client::lb::{ClusterDiscovery, XdsLbService};
 use crate::client::route::{Router, XdsRoutingLayer};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
 use crate::xds::cache::XdsCache;
-use crate::xds::cluster_discovery::{DefaultConnector, XdsClusterDiscovery};
+use crate::xds::cluster_discovery::{DefaultMakeConnector, XdsClusterDiscovery};
 use crate::xds::resource_manager::XdsResourceManager;
 use crate::xds::routing::XdsRouter;
 use http::Request;
@@ -204,7 +204,7 @@ impl XdsChannelBuilder {
     ) -> XdsChannelGrpc {
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
         let discovery: Arc<dyn ClusterDiscovery> = Arc::new(XdsClusterDiscovery::new(cache));
-        let connector = Arc::new(DefaultConnector);
+        let connector = Arc::new(DefaultMakeConnector);
         let retry_policy = GrpcRetryPolicy::new(GrpcRetryPolicyConfig::default());
 
         let resources = Arc::new(XdsChannelResources {
@@ -238,30 +238,31 @@ impl XdsChannelBuilder {
         self.build_tonic_grpc_channel()
     }
 
-    /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, connector, and retry policy.
+    /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, make_connector, and retry policy.
     #[cfg(test)]
-    pub(crate) fn build_grpc_channel_from_parts<C>(
+    pub(crate) fn build_grpc_channel_from_parts<MC>(
         &self,
         router: Arc<dyn Router>,
         discovery: Arc<dyn ClusterDiscovery>,
-        connector: Arc<C>,
+        make_connector: Arc<MC>,
         retry_policy: GrpcRetryPolicy,
     ) -> XdsChannelGrpc
     where
-        C: crate::client::endpoint::Connector + Send + Sync + 'static,
-        C::Service: Service<Request<TonicBody>, Response = http::Response<TonicBody>>
+        MC: crate::client::endpoint::MakeConnector,
+        MC::Connector: Send + Sync + 'static,
+        MC::Service: Service<Request<TonicBody>, Response = http::Response<TonicBody>>
             + tower::load::Load
             + Clone
             + Send
             + 'static,
-        <C::Service as Service<Request<TonicBody>>>::Error: Into<BoxError>,
-        <C::Service as Service<Request<TonicBody>>>::Future: Send + 'static,
-        <C::Service as tower::load::Load>::Metric: PartialOrd,
+        <MC::Service as Service<Request<TonicBody>>>::Error: Into<BoxError>,
+        <MC::Service as Service<Request<TonicBody>>>::Future: Send + 'static,
+        <MC::Service as tower::load::Load>::Metric: PartialOrd,
     {
         let routing_layer = XdsRoutingLayer::new(router);
         let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
-        let lb_service = XdsLbService::new(cluster_registry, discovery, connector);
+        let lb_service = XdsLbService::new(cluster_registry, discovery, make_connector);
         let inner = ServiceBuilder::new()
             .layer(routing_layer)
             .layer(retry_layer)
@@ -352,6 +353,28 @@ mod tests {
         fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
             let channel = self.channels[addr].clone();
             Box::pin(std::future::ready(LbChannel::new(addr.clone(), channel)))
+        }
+    }
+
+    /// A test MakeConnector that always returns the same TestConnector.
+    struct TestMakeConnector {
+        connector: Arc<TestConnector>,
+    }
+
+    impl TestMakeConnector {
+        fn from_test_servers(servers: &[TestServer]) -> Arc<Self> {
+            Arc::new(Self {
+                connector: TestConnector::from_test_servers(servers),
+            })
+        }
+    }
+
+    impl crate::client::endpoint::MakeConnector for TestMakeConnector {
+        type Service = LbChannel<Channel>;
+        type Connector = TestConnector;
+
+        fn make_connector(&self, _cluster_name: &str) -> Arc<Self::Connector> {
+            self.connector.clone()
         }
     }
 
@@ -452,7 +475,7 @@ mod tests {
         let (_, servers) = setup_grpc_servers(num_servers).await;
 
         // Create a mock XdsManager with the test servers
-        let connector = TestConnector::from_test_servers(&servers);
+        let connector = TestMakeConnector::from_test_servers(&servers);
         let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
 
         let xds_channel_builder = XdsChannelBuilder::new(test_config());
@@ -526,7 +549,7 @@ mod tests {
             .expect("Failed to spawn server");
 
         let servers = vec![server];
-        let connector = TestConnector::from_test_servers(&servers);
+        let connector = TestMakeConnector::from_test_servers(&servers);
         let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
 
         let retry_policy = GrpcRetryPolicy::new(
@@ -601,12 +624,12 @@ mod tests {
     /// Builds an XdsChannelGrpc using real XdsRouter and XdsClusterDiscovery
     /// backed by the given cache.
     async fn build_xds_channel_from_cache(cache: Arc<XdsCache>) -> XdsChannelGrpc {
-        use crate::xds::cluster_discovery::{DefaultConnector, XdsClusterDiscovery};
+        use crate::xds::cluster_discovery::{DefaultMakeConnector, XdsClusterDiscovery};
         use crate::xds::routing::XdsRouter;
 
         let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
         let discovery: Arc<dyn ClusterDiscovery> = Arc::new(XdsClusterDiscovery::new(cache));
-        let connector = Arc::new(DefaultConnector);
+        let connector = Arc::new(DefaultMakeConnector);
 
         let builder = XdsChannelBuilder::new(test_config());
         builder.build_grpc_channel_from_parts(router, discovery, connector, GrpcRetryPolicy::default())
